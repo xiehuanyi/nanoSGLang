@@ -1,18 +1,19 @@
 """
-Inference Engine — Continuous Batching with Paged Attention.
+Inference Engine — Continuous Batching with Ragged Batch Forward.
 
-This is the heart of nanoSGLang. It runs an async loop:
+Core loop:
   1. Scheduler builds a mixed batch (prefill chunks + decode tokens)
-  2. Engine executes one forward pass on the batch
-  3. Sample tokens for decode requests
-  4. Update KV cache, advance prefill positions
-  5. Stream output tokens to waiting clients
+  2. Engine packs all requests into a single flat tensor (ragged batch)
+  3. Single forward pass with cu_seqlens for sequence boundaries
+  4. Scatter results back to individual requests, sample, update cache
+  5. Stream output tokens to clients
 
-Phase 1 (naive) mode is also kept for simplicity / debugging.
+Two modes:
+  - naive=True:  Phase 1 single-request, contiguous KV cache
+  - naive=False: Continuous batching, paged KV cache, ragged batch forward
 """
 
 import asyncio
-import math
 import time
 import uuid
 from typing import AsyncIterator, Optional
@@ -28,11 +29,6 @@ from nano_sglang.engine.scheduler import Scheduler, ScheduleBatch, ScheduledRequ
 from nano_sglang.engine.sampling import sample_token
 
 
-# ---------------------------------------------------------------------------
-# Output token wrapper
-# ---------------------------------------------------------------------------
-
-
 class TokenOutput:
     __slots__ = ("token_id", "text", "finished")
 
@@ -42,47 +38,29 @@ class TokenOutput:
         self.finished = finished
 
 
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
-
-
 class InferenceEngine:
-    """
-    Continuous batching inference engine.
-
-    Modes:
-      - naive=True:  Phase 1 single-request mode (no scheduler, contiguous KV cache)
-      - naive=False: Phase 2+ continuous batching with paged KV cache
-    """
-
     def __init__(
         self,
         model_path: str,
         device: str = "cuda",
         dtype: Optional[torch.dtype] = None,
         max_seq_len: int = 4096,
-        # Paged attention settings
         num_blocks: int = 256,
         block_size: int = 16,
-        # Scheduler settings
         max_batch_tokens: int = 4096,
         max_running_requests: int = 64,
         prefill_chunk_size: int = 512,
-        # Mode
         naive: bool = False,
     ):
         self.device = device
         self.max_seq_len = max_seq_len
         self.naive = naive
 
-        # Load model + tokenizer
         self.model, self.config = load_model_from_pretrained(model_path, device, dtype)
         self.tokenizer = Tokenizer(model_path)
         self.dtype = next(self.model.parameters()).dtype
 
         if not naive:
-            # Phase 2+: paged KV cache + scheduler
             self.block_manager = BlockManager(
                 num_blocks=num_blocks,
                 block_size=block_size,
@@ -107,7 +85,6 @@ class InferenceEngine:
             print(f"  Scheduler: max_batch_tokens={max_batch_tokens}, "
                   f"chunk_size={prefill_chunk_size}")
 
-            # Start the engine loop
             self._running = True
             self._loop_task: Optional[asyncio.Task] = None
         else:
@@ -115,12 +92,10 @@ class InferenceEngine:
             print("  Mode: naive (single request)")
 
     async def start(self):
-        """Start the continuous batching loop (call after event loop is running)."""
         if not self.naive and self._loop_task is None:
             self._loop_task = asyncio.create_task(self._engine_loop())
 
     async def stop(self):
-        """Stop the engine loop."""
         self._running = False
         if self._loop_task is not None:
             self._loop_task.cancel()
@@ -130,7 +105,7 @@ class InferenceEngine:
                 pass
 
     # ------------------------------------------------------------------
-    # Public API: add request and get streaming output
+    # Public API
     # ------------------------------------------------------------------
 
     async def add_request(
@@ -138,7 +113,6 @@ class InferenceEngine:
         prompt_tokens: list[int],
         sampling_params: Optional[SamplingParams] = None,
     ) -> Request:
-        """Add a request and return the Request object (read its output_queue)."""
         if sampling_params is None:
             sampling_params = SamplingParams()
 
@@ -149,7 +123,6 @@ class InferenceEngine:
         )
 
         if self.naive:
-            # For naive mode, run generation directly
             asyncio.create_task(self._naive_generate(req))
         else:
             await self.request_queue.add(req)
@@ -161,7 +134,6 @@ class InferenceEngine:
         prompt_tokens: list[int],
         sampling_params: Optional[SamplingParams] = None,
     ) -> AsyncIterator[TokenOutput]:
-        """Convenience wrapper: add request and yield outputs."""
         req = await self.add_request(prompt_tokens, sampling_params)
         while True:
             output = await req.output_queue.get()
@@ -170,207 +142,209 @@ class InferenceEngine:
                 break
 
     # ------------------------------------------------------------------
-    # Phase 2+: Continuous batching engine loop
+    # Continuous batching engine loop
     # ------------------------------------------------------------------
 
     async def _engine_loop(self):
-        """
-        Main loop: schedule → forward → sample → update, repeat.
-
-        This runs continuously while there are requests.
-        Uses asyncio.sleep(0) to yield control between steps.
-        """
         while self._running:
-            # Check if there's work to do
             if self.request_queue.num_waiting == 0 and self.request_queue.num_running == 0:
-                await asyncio.sleep(0.001)  # Idle
+                await asyncio.sleep(0.001)
                 continue
 
-            # Schedule the next batch
             batch = self.scheduler.schedule()
             if batch.is_empty:
                 await asyncio.sleep(0.001)
                 continue
 
-            # Execute forward pass
-            await self._execute_batch(batch)
-
-            # Yield control
+            await self._execute_batch_ragged(batch)
             await asyncio.sleep(0)
 
     @torch.inference_mode()
-    async def _execute_batch(self, batch: ScheduleBatch):
+    async def _execute_batch_ragged(self, batch: ScheduleBatch):
         """
-        Execute one forward pass for a batch of mixed prefill + decode requests.
+        Execute one forward pass for the entire batch using ragged/packed tensors.
 
-        For simplicity in this implementation, we process each request separately
-        within the batch. A production system would pack them into a single
-        padded tensor with proper attention masks.
+        All requests' tokens are concatenated into a single flat tensor.
+        cu_seqlens marks boundaries. One forward pass processes everything.
         """
-        for sr in batch.scheduled:
+        num_layers = self.config.num_hidden_layers
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim
+
+        # Filter active requests
+        active = [sr for sr in batch.scheduled
+                  if sr.request.status != RequestStatus.FINISHED]
+        if not active:
+            return
+
+        # ------------------------------------------------------------------
+        # Build ragged batch tensors
+        # ------------------------------------------------------------------
+        all_input_ids = []
+        all_positions = []
+        q_lens = []        # number of new tokens per request (Q)
+        k_lens = []        # total KV length per request (cached + new)
+        cache_starts = []  # where cached KV starts for each request
+
+        for sr in active:
             req = sr.request
-            if req.status == RequestStatus.FINISHED:
-                continue
-
-            bt = self.scheduler.get_block_table(req.request_id)
-            if bt is None:
-                continue
-
-            input_ids = torch.tensor(
-                [sr.input_token_ids], device=self.device
-            )
             num_input = len(sr.input_token_ids)
 
             if sr.is_prefill:
-                # Prefill (possibly chunked)
                 start_pos = req.num_prefilled
-                position_ids = torch.arange(
-                    start_pos, start_pos + num_input, device=self.device
-                ).unsqueeze(0)
-
-                attn_mask = self._make_causal_mask(num_input, start_pos + num_input)
-
-                # Forward pass using naive KV cache for this request
-                # (We use a temporary contiguous cache and then copy into paged blocks)
-                logits = self._forward_with_paged_cache(
-                    input_ids, position_ids, attn_mask, req, bt, start_pos
-                )
-
-                req.num_prefilled += num_input
-
-                # If prefill is complete, sample the first token
-                if not req.is_prefilling:
-                    next_token = sample_token(
-                        logits[:, -1, :],
-                        temperature=req.sampling_params.temperature,
-                        top_p=req.sampling_params.top_p,
-                        top_k=req.sampling_params.top_k,
-                    ).item()
-
-                    req.output_token_ids.append(next_token)
-                    req.first_token_time = time.time()
-
-                    text = self.tokenizer.decode([next_token])
-                    finished = self._check_finished(req, next_token)
-
-                    await req.output_queue.put(
-                        TokenOutput(next_token, text, finished)
-                    )
-
-                    if finished:
-                        self.scheduler.finish_request(req)
-
+                positions = list(range(start_pos, start_pos + num_input))
+                cached_len = start_pos  # tokens already cached from prior chunks
             else:
-                # Decode: single token
                 pos = req.current_len - 1
-                position_ids = torch.tensor([[pos]], device=self.device)
-                attn_mask = self._make_causal_mask(1, req.current_len)
+                positions = [pos]
+                cached_len = pos  # everything before this decode token
 
-                # Ensure we have block space
+            all_input_ids.extend(sr.input_token_ids)
+            all_positions.extend(positions)
+            q_lens.append(num_input)
+            k_lens.append(cached_len + num_input)  # total KV = cached + new
+            cache_starts.append(cached_len)
+
+            # Ensure blocks exist for decode
+            if not sr.is_prefill:
                 self.scheduler.ensure_decode_block(req)
 
-                logits = self._forward_with_paged_cache(
-                    input_ids, position_ids, attn_mask, req, bt, pos
-                )
+        total_q = len(all_input_ids)
+        batch_size = len(active)
+
+        input_ids = torch.tensor(all_input_ids, device=self.device)
+        positions = torch.tensor(all_positions, device=self.device)
+
+        # Build cu_seqlens
+        cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        for i in range(batch_size):
+            cu_seqlens_q[i + 1] = cu_seqlens_q[i] + q_lens[i]
+            cu_seqlens_k[i + 1] = cu_seqlens_k[i] + k_lens[i]
+
+        max_seqlen_q = max(q_lens)
+        max_seqlen_k = max(k_lens)
+
+        # ------------------------------------------------------------------
+        # Assemble cached KV per layer
+        # ------------------------------------------------------------------
+        cached_kvs: list[tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
+
+        total_cached = sum(cache_starts)
+        if total_cached > 0:
+            for layer_idx in range(num_layers):
+                k_parts = []
+                v_parts = []
+                for i, sr in enumerate(active):
+                    req = sr.request
+                    cached_len = cache_starts[i]
+                    if cached_len > 0:
+                        bt = self.scheduler.get_block_table(req.request_id)
+                        if bt is not None:
+                            k_cached, v_cached = self.block_manager.read_kv(
+                                bt.block_indices, layer_idx, cached_len
+                            )
+                            # read_kv returns (num_kv_heads, cached_len, head_dim)
+                            # transpose to (cached_len, num_kv_heads, head_dim)
+                            k_parts.append(k_cached.transpose(0, 1))
+                            v_parts.append(v_cached.transpose(0, 1))
+                        else:
+                            k_parts.append(torch.zeros(
+                                cached_len, num_kv_heads, head_dim,
+                                dtype=self.dtype, device=self.device))
+                            v_parts.append(torch.zeros(
+                                cached_len, num_kv_heads, head_dim,
+                                dtype=self.dtype, device=self.device))
+                    # If cached_len == 0, no KV to prepend for this request
+
+                if k_parts:
+                    cached_kvs.append((torch.cat(k_parts, dim=0),
+                                       torch.cat(v_parts, dim=0)))
+                else:
+                    cached_kvs.append((None, None))
+        else:
+            cached_kvs = [(None, None)] * num_layers
+
+        # ------------------------------------------------------------------
+        # Single forward pass
+        # ------------------------------------------------------------------
+        logits, new_kvs = self.model.forward_packed(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            cached_kvs=cached_kvs,
+        )
+
+        # ------------------------------------------------------------------
+        # Write new KV to paged blocks & sample tokens
+        # ------------------------------------------------------------------
+        q_offset = 0
+        for i, sr in enumerate(active):
+            req = sr.request
+            num_input = q_lens[i]
+            bt = self.scheduler.get_block_table(req.request_id)
+            if bt is None:
+                q_offset += num_input
+                continue
+
+            # Write new K/V into paged blocks
+            start_pos = cache_starts[i]
+            for layer_idx in range(num_layers):
+                new_k = new_kvs[layer_idx][0][q_offset:q_offset + num_input]
+                new_v = new_kvs[layer_idx][1][q_offset:q_offset + num_input]
+
+                for t in range(num_input):
+                    abs_pos = start_pos + t
+                    block_idx = abs_pos // self.block_manager.block_size
+                    slot_offset = abs_pos % self.block_manager.block_size
+
+                    while block_idx >= len(bt.block_indices):
+                        bt.block_indices.append(self.block_manager.allocate())
+
+                    # new_k[t] is (num_kv_heads, head_dim), write_kv expects
+                    # (num_kv_heads, num_tokens, head_dim)
+                    self.block_manager.write_kv(
+                        bt.block_indices[block_idx],
+                        layer_idx,
+                        slot_offset,
+                        new_k[t:t + 1].transpose(0, 1),  # (kv_heads, 1, dim)
+                        new_v[t:t + 1].transpose(0, 1),
+                    )
+
+            # Update prefill progress
+            if sr.is_prefill:
+                req.num_prefilled += num_input
+
+            # Sample token if this request should produce output
+            should_sample = (not sr.is_prefill) or (sr.is_prefill and not req.is_prefilling)
+
+            if should_sample:
+                # Get logits for the last token of this request
+                last_logit = logits[q_offset + num_input - 1:q_offset + num_input]
 
                 next_token = sample_token(
-                    logits[:, -1, :],
+                    last_logit,
                     temperature=req.sampling_params.temperature,
                     top_p=req.sampling_params.top_p,
                     top_k=req.sampling_params.top_k,
                 ).item()
 
                 req.output_token_ids.append(next_token)
+                if req.first_token_time is None:
+                    req.first_token_time = time.time()
 
                 text = self.tokenizer.decode([next_token])
                 finished = self._check_finished(req, next_token)
 
-                await req.output_queue.put(
-                    TokenOutput(next_token, text, finished)
-                )
+                await req.output_queue.put(TokenOutput(next_token, text, finished))
 
                 if finished:
                     self.scheduler.finish_request(req)
 
-    def _forward_with_paged_cache(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        attn_mask: torch.Tensor,
-        req: Request,
-        bt,
-        start_pos: int,
-    ) -> torch.Tensor:
-        """
-        Forward pass that reads/writes paged KV cache.
-
-        We use a hybrid approach: the model's forward pass uses contiguous KV cache
-        tensors (assembled from paged blocks), and we write back the new KV entries
-        to the paged blocks after the forward pass.
-        """
-        bsz, seq_len = input_ids.shape
-        num_layers = self.config.num_hidden_layers
-        num_kv_heads = self.config.num_key_value_heads
-        head_dim = self.config.head_dim
-
-        # Build per-layer contiguous KV cache views from paged blocks
-        total_len = start_pos + seq_len
-        kv_caches = []
-        for layer_idx in range(num_layers):
-            if start_pos > 0:
-                # Read existing KV from blocks
-                k_existing, v_existing = self.block_manager.read_kv(
-                    bt.block_indices, layer_idx, start_pos
-                )
-                # Allocate contiguous buffer
-                k_buf = torch.zeros(
-                    1, num_kv_heads, total_len, head_dim,
-                    dtype=self.dtype, device=self.device,
-                )
-                v_buf = torch.zeros_like(k_buf)
-                k_buf[0, :, :start_pos, :] = k_existing
-                v_buf[0, :, :start_pos, :] = v_existing
-            else:
-                k_buf = torch.zeros(
-                    1, num_kv_heads, total_len, head_dim,
-                    dtype=self.dtype, device=self.device,
-                )
-                v_buf = torch.zeros_like(k_buf)
-
-            kv_caches.append((k_buf, v_buf))
-
-        # Forward pass
-        logits = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            kv_caches=kv_caches,
-            cache_position=start_pos,
-            attention_mask=attn_mask,
-        )
-
-        # Write new KV entries back to paged blocks
-        for layer_idx in range(num_layers):
-            k_new = kv_caches[layer_idx][0][0, :, start_pos:total_len, :]
-            v_new = kv_caches[layer_idx][1][0, :, start_pos:total_len, :]
-
-            # Write token by token into the correct block/slot
-            for t in range(seq_len):
-                abs_pos = start_pos + t
-                block_idx = abs_pos // self.block_manager.block_size
-                slot_offset = abs_pos % self.block_manager.block_size
-
-                while block_idx >= len(bt.block_indices):
-                    bt.block_indices.append(self.block_manager.allocate())
-
-                self.block_manager.write_kv(
-                    bt.block_indices[block_idx],
-                    layer_idx,
-                    slot_offset,
-                    k_new[:, t:t + 1, :],
-                    v_new[:, t:t + 1, :],
-                )
-
-        return logits
+            q_offset += num_input
 
     def _check_finished(self, req: Request, token_id: int) -> bool:
         if token_id == self.tokenizer.eos_token_id:
@@ -389,7 +363,6 @@ class InferenceEngine:
 
     @torch.inference_mode()
     async def _naive_generate(self, req: Request):
-        """Phase 1 naive generation: single request, contiguous KV cache."""
         async with self._lock:
             prompt_tokens = req.prompt_tokens
             prompt_len = len(prompt_tokens)
@@ -404,7 +377,6 @@ class InferenceEngine:
                 device=self.device,
             )
 
-            # Prefill
             input_ids = torch.tensor([prompt_tokens], device=self.device)
             position_ids = torch.arange(prompt_len, device=self.device).unsqueeze(0)
             attn_mask = self._make_causal_mask(prompt_len, prompt_len)
@@ -435,7 +407,6 @@ class InferenceEngine:
 
             cur_pos = prompt_len
 
-            # Decode loop
             for _ in range(req.sampling_params.max_tokens - 1):
                 if cur_pos >= self.max_seq_len - 1:
                     await req.output_queue.put(TokenOutput(next_token, "", True))
@@ -471,10 +442,6 @@ class InferenceEngine:
                     return
 
                 await asyncio.sleep(0)
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
 
     def _make_causal_mask(self, seq_len: int, full_len: int) -> torch.Tensor:
         if seq_len == full_len:
