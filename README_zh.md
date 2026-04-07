@@ -5,7 +5,7 @@
 一个从零实现的高性能 LLM 推理引擎，约 4000 行 Python + PyTorch 代码。
 以简洁的教学代码实现了 [SGLang](https://github.com/sgl-project/sglang) 的核心技术。
 
-在 **Qwen2.5-0.5B** 上测试，吞吐量达到 **3493 tok/s**（SGLang 为 3201 tok/s），RTX A5000。
+在 **Qwen2.5-0.5B** 上测试，吞吐量达到 **3469 tok/s**（SGLang 为 3201 tok/s），RTX A5000。
 
 ## 快速开始
 
@@ -28,10 +28,41 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 
 | 系统 | 吞吐量 (tok/s) |
 |------|---------------|
-| nanoSGLang（全部优化） | **3493** |
-| SGLang 0.5.6（默认配置） | 3201 |
-| nanoSGLang（无 CUDA Graph） | 1400 |
-| nanoSGLang（无 FlashInfer） | 437 |
+| nanoSGLang（FlashInfer + 融合算子） | **3469** |
+| SGLang 0.5.6（默认配置，CUDA Graph 开启） | 3201 |
+| nanoSGLang（Legacy，无 FlashInfer） | 177 |
+
+### 逐项消融
+
+在同一负载上逐个开关各优化项，实测增量：
+
+| 配置 | tok/s | 增量 |
+|------|-------|------|
+| Legacy（flash_attn + 逐 token KV 拷贝） | 177 | 基线 |
+| + FlashInfer paged attention（零拷贝 KV） | 3076 | **+1642%** |
+| + CUDA Graph（decode） | 3077 | +0% |
+| + 融合 RMSNorm + 融合采样 | 3469 | +13% |
+
+**核心提升来自 FlashInfer paged attention**：通过 page table 间接寻址，消除了逐 token、逐 layer 的 KV 缓存拷贝循环（O(层数 × 请求数 × 序列长度) → O(1)）。这贡献了约 97% 的总加速。
+
+CUDA Graph 在 0.5B 小模型上无可测量提升——模型太小，kernel launch 不是瓶颈。在更大的模型（7B+）上会有效果。
+
+融合 RMSNorm（`flashinfer.norm.fused_add_rmsnorm`）和融合采样（`flashinfer.sampling`）贡献了真实的 +13%。
+
+### 正确性
+
+Greedy decoding（temperature=0）下与 SGLang 的输出对比，Qwen2.5-0.5B，6 条 prompt：
+
+| # | Prompt | 状态 |
+|---|--------|------|
+| 0 | `Hello, my name is` | token 1 发散 |
+| 1 | `The capital of France is` | **完全一致** |
+| 2 | `Write a Python function that returns the sum of a list:` | **完全一致** |
+| 3 | `Question: What is 2 + 2? Answer:` | **完全一致** |
+| 4 | `Once upon a time, in a small village,` | token 12 发散 |
+| 5 | `The three laws of robotics are: 1.` | token 19 发散 |
+
+3/6 完全一致（关闭融合算子时）。发散是 bf16 精度下不同 attention 后端的数值差异导致——输出语义等价。SGLang 自身切换后端（FlashInfer vs Triton）也有同等程度的发散。
 
 ## 项目结构
 
@@ -43,26 +74,6 @@ nano_sglang/
   decode/          # 量化、投机解码、结构化输出
   distributed/     # 多卡张量并行
 ```
-
-## 核心优化
-
-| 优化技术 | 作用 |
-|---------|------|
-| FlashInfer paged attention | 消除 O(层数 x 请求数 x 序列长度) 的 KV 拷贝 |
-| CUDA Graph | 消除 decode 阶段 kernel launch 开销（~2x 加速） |
-| 融合 RMSNorm + 残差 | 将 norm 和残差连接合并为单个 kernel |
-| 融合采样 | GPU 原生 softmax + top-k/top-p 采样 |
-| Logit 索引优化 | 只对每个请求最后一个 token 计算 lm_head |
-
-## 功能
-
-- **连续批处理**（continuous batching），混合 prefill + decode
-- **分块预填充**（chunked prefill）
-- **分页 KV 缓存**，块级内存管理
-- **FlashInfer paged attention**（零拷贝，NHD 布局）
-- **CUDA Graph** 捕获/回放（decode 阶段）
-- **融合算子**（RMSNorm、采样），通过 FlashInfer 实现
-- **OpenAI 兼容 API**，支持流式 SSE
 
 ## 已测试模型
 

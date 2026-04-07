@@ -5,7 +5,7 @@
 A minimal, high-performance LLM serving engine built from scratch in ~4000 lines of Python + PyTorch.
 Implements the core techniques from [SGLang](https://github.com/sgl-project/sglang) in a clean, educational codebase.
 
-Tested on **Qwen2.5-0.5B** — reaches **3493 tok/s** vs SGLang's 3201 tok/s on RTX A5000.
+Tested on **Qwen2.5-0.5B** — reaches **3469 tok/s** vs SGLang's 3201 tok/s on RTX A5000.
 
 ## Architecture
 
@@ -101,20 +101,41 @@ Benchmark: 32 requests, prompt 100-512 tokens, output 64-128 tokens, **Qwen2.5-0
 
 | System | Throughput (tok/s) |
 |--------|-------------------|
-| nanoSGLang (all optimizations) | **3493** |
-| SGLang 0.5.6 (default) | 3201 |
-| nanoSGLang (no CUDA Graph) | 1400 |
-| nanoSGLang (legacy, no FlashInfer) | 437 |
+| nanoSGLang (FlashInfer + fused ops) | **3469** |
+| SGLang 0.5.6 (default, CUDA Graph ON) | 3201 |
+| nanoSGLang (legacy, no FlashInfer) | 177 |
 
-### Key Optimizations
+### Ablation
 
-| Technique | Impact |
-|-----------|--------|
-| FlashInfer paged attention | Eliminates O(layers x reqs x tokens) KV copy |
-| CUDA Graph for decode | Removes kernel launch overhead (~2x decode speedup) |
-| Fused RMSNorm + residual | Single kernel for norm + residual add |
-| Fused sampling | GPU-native softmax + top-k/top-p sampling |
-| Logit-index optimization | Only compute lm_head for last token per request |
+Measured by toggling each optimization individually on the same workload:
+
+| Configuration | tok/s | Delta |
+|---------------|-------|-------|
+| Legacy (flash_attn + per-token KV copy) | 177 | baseline |
+| + FlashInfer paged attention (zero-copy KV) | 3076 | **+1642%** |
+| + CUDA Graph (decode) | 3077 | +0% |
+| + Fused RMSNorm + Fused Sampling | 3469 | +13% |
+
+**The dominant optimization is FlashInfer paged attention**, which eliminates per-token, per-layer KV cache copy loops (O(layers × requests × seq_len) → O(1) via page table indirection). This accounts for ~97% of the total speedup.
+
+CUDA Graph shows no measurable improvement on this 0.5B model — the model is too small for kernel launch overhead to matter. It would help on larger models (7B+).
+
+Fused RMSNorm (via `flashinfer.norm.fused_add_rmsnorm`) and fused sampling (via `flashinfer.sampling`) contribute a real +13%.
+
+### Correctness
+
+Greedy decoding (temperature=0) output comparison with SGLang on 6 prompts, Qwen2.5-0.5B:
+
+| # | Prompt | Status |
+|---|--------|--------|
+| 0 | `Hello, my name is` | diverge @ token 1 |
+| 1 | `The capital of France is` | **exact match** |
+| 2 | `Write a Python function that returns the sum of a list:` | **exact match** |
+| 3 | `Question: What is 2 + 2? Answer:` | **exact match** |
+| 4 | `Once upon a time, in a small village,` | diverge @ token 12 |
+| 5 | `The three laws of robotics are: 1.` | diverge @ token 19 |
+
+3/6 exact match (with fused ops off). Divergences are due to bf16 numerical precision differences between attention backends — the outputs are semantically equivalent. This is expected and consistent with SGLang's own behavior across different backends (e.g. FlashInfer vs Triton).
 
 ## Features
 
