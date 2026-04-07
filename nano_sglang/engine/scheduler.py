@@ -219,12 +219,14 @@ class Scheduler:
         return self.block_tables.get(request_id)
 
     def ensure_decode_block(self, req: Request):
-        """Ensure there's space for one more token in the request's block table."""
+        """Ensure there's a block for the current decode position."""
         bt = self.block_tables.get(req.request_id)
         if bt is None:
             return
-        tokens_in_last_block = req.current_len % self.block_manager.block_size
-        if tokens_in_last_block == 0 and req.current_len > 0:
-            # Need a new block
+        # Need enough blocks to cover position (current_len - 1)
+        needed = (req.current_len - 1) // self.block_manager.block_size + 1
+        while len(bt.block_indices) < needed:
             if self.block_manager.can_allocate(1):
                 bt.block_indices.append(self.block_manager.allocate())
+            else:
+                break

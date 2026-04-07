@@ -57,10 +57,14 @@ class BlockManager:
         self.dtype = dtype
         self.device = device
 
-        # Pre-allocate all blocks as one big tensor
-        # Shape: (num_blocks, num_layers, 2, num_kv_heads, block_size, head_dim)
-        self.gpu_cache = torch.zeros(
-            num_blocks, num_layers, 2, num_kv_heads, block_size, head_dim,
+        # FlashInfer-compatible KV cache layout (NHD)
+        # Shape: (num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+        self.k_cache = torch.zeros(
+            num_layers, num_blocks, block_size, num_kv_heads, head_dim,
+            dtype=dtype, device=device,
+        )
+        self.v_cache = torch.zeros(
+            num_layers, num_blocks, block_size, num_kv_heads, head_dim,
             dtype=dtype, device=device,
         )
 
@@ -94,7 +98,6 @@ class BlockManager:
         self.ref_counts[block_id] -= 1
         if self.ref_counts[block_id] <= 0:
             del self.ref_counts[block_id]
-            self.gpu_cache[block_id].zero_()
             self.free_blocks.append(block_id)
 
     def increment_ref(self, block_id: int):
@@ -129,8 +132,9 @@ class BlockManager:
         k, v: (num_kv_heads, num_tokens, head_dim)
         """
         num_tokens = k.shape[1]
-        self.gpu_cache[block_id, layer_idx, 0, :, slot_offset:slot_offset + num_tokens, :] = k
-        self.gpu_cache[block_id, layer_idx, 1, :, slot_offset:slot_offset + num_tokens, :] = v
+        # Transpose (kv_heads, tokens, dim) -> (tokens, kv_heads, dim) for NHD layout
+        self.k_cache[layer_idx, block_id, slot_offset:slot_offset + num_tokens] = k.transpose(0, 1)
+        self.v_cache[layer_idx, block_id, slot_offset:slot_offset + num_tokens] = v.transpose(0, 1)
 
     def read_kv(
         self,
@@ -147,16 +151,19 @@ class BlockManager:
         remaining = total_tokens
         for block_id in block_ids:
             n = min(remaining, self.block_size)
-            k_parts.append(self.gpu_cache[block_id, layer_idx, 0, :, :n, :])
-            v_parts.append(self.gpu_cache[block_id, layer_idx, 1, :, :n, :])
+            # NHD layout: (block_size, kv_heads, head_dim)
+            k_parts.append(self.k_cache[layer_idx, block_id, :n])
+            v_parts.append(self.v_cache[layer_idx, block_id, :n])
             remaining -= n
             if remaining <= 0:
                 break
-        return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
+        # (total_tokens, kv_heads, dim) -> (kv_heads, total_tokens, dim)
+        return torch.cat(k_parts, dim=0).transpose(0, 1), \
+               torch.cat(v_parts, dim=0).transpose(0, 1)
 
     @property
     def memory_bytes(self) -> int:
-        return self.gpu_cache.nelement() * self.gpu_cache.element_size()
+        return (self.k_cache.nelement() + self.v_cache.nelement()) * self.k_cache.element_size()
 
     def __repr__(self) -> str:
         mb = self.memory_bytes / 1024 / 1024

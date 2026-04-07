@@ -4,5 +4,6 @@ safetensors
 fastapi
 uvicorn[standard]
 sse-starlette
-# Optional: flash-attn>=2.5 (requires SM>=80, i.e. A100/H100)
+flashinfer-python>=0.6
+# Optional: flash-attn>=2.5 (requires SM>=80, fallback when flashinfer unavailable)
 # pip install flash-attn --no-build-isolation
