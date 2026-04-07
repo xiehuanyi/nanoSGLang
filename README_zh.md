@@ -51,18 +51,18 @@ CUDA Graph 在 0.5B 小模型上无可测量提升——模型太小，kernel la
 
 ### 正确性
 
-Greedy decoding（temperature=0）下与 SGLang 的输出对比，Qwen2.5-0.5B，6 条 prompt：
+Greedy decoding（temperature=0）下与 SGLang 的输出对比，Qwen2.5-0.5B，6 条 prompt（关闭融合算子）：
 
-| # | Prompt | 状态 |
-|---|--------|------|
-| 0 | `Hello, my name is` | token 1 发散 |
-| 1 | `The capital of France is` | **完全一致** |
-| 2 | `Write a Python function that returns the sum of a list:` | **完全一致** |
-| 3 | `Question: What is 2 + 2? Answer:` | **完全一致** |
-| 4 | `Once upon a time, in a small village,` | token 12 发散 |
-| 5 | `The three laws of robotics are: 1.` | token 19 发散 |
+| # | Prompt | 状态 | nanoSGLang | SGLang |
+|---|--------|------|------------|--------|
+| 0 | `Hello, my name is` | token 1 发散 | John **and** I am a 20 year old male... | John**.** I am a student of the University... |
+| 1 | `The capital of France is` | **完全一致** | Paris. It is the largest city in Europe... | *（相同）* |
+| 2 | `Write a Python function...` | **完全一致** | def sum_list(lst): return sum(lst)... | *（相同）* |
+| 3 | `Question: What is 2 + 2?` | **完全一致** | 4\nIs the above claim true?... | *（相同）* |
+| 4 | `Once upon a time, in a small village,` | token 12 发散 | ...Owl had **a big family** ... | ...Owl had **a special talent for predicting**... |
+| 5 | `The three laws of robotics are: 1.` | token 19 发散 | ...The law of the minimum **time**... | ...The law of the minimum **effort**... |
 
-3/6 完全一致（关闭融合算子时）。发散是 bf16 精度下不同 attention 后端的数值差异导致——输出语义等价。SGLang 自身切换后端（FlashInfer vs Triton）也有同等程度的发散。
+3/6 完全一致。发散处是 top-2 logits 非常接近的位置，bf16 精度下不同 attention 后端的浮点舍入差异导致 argmax 翻转。所有输出语义连贯。SGLang 自身切换后端（FlashInfer vs Triton）也有同等程度的发散。
 
 ## 项目结构
 

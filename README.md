@@ -124,18 +124,18 @@ Fused RMSNorm (via `flashinfer.norm.fused_add_rmsnorm`) and fused sampling (via 
 
 ### Correctness
 
-Greedy decoding (temperature=0) output comparison with SGLang on 6 prompts, Qwen2.5-0.5B:
+Greedy decoding (temperature=0) output comparison with SGLang on 6 prompts, Qwen2.5-0.5B (fused ops off):
 
-| # | Prompt | Status |
-|---|--------|--------|
-| 0 | `Hello, my name is` | diverge @ token 1 |
-| 1 | `The capital of France is` | **exact match** |
-| 2 | `Write a Python function that returns the sum of a list:` | **exact match** |
-| 3 | `Question: What is 2 + 2? Answer:` | **exact match** |
-| 4 | `Once upon a time, in a small village,` | diverge @ token 12 |
-| 5 | `The three laws of robotics are: 1.` | diverge @ token 19 |
+| # | Prompt | Status | nanoSGLang | SGLang |
+|---|--------|--------|------------|--------|
+| 0 | `Hello, my name is` | diverge @ token 1 | John **and** I am a 20 year old male... | John**.** I am a student of the University... |
+| 1 | `The capital of France is` | **exact match** | Paris. It is the largest city in Europe... | *(same)* |
+| 2 | `Write a Python function...` | **exact match** | def sum_list(lst): return sum(lst)... | *(same)* |
+| 3 | `Question: What is 2 + 2?` | **exact match** | 4\nIs the above claim true?... | *(same)* |
+| 4 | `Once upon a time, in a small village,` | diverge @ token 12 | ...Owl had **a big family** ... | ...Owl had **a special talent for predicting**... |
+| 5 | `The three laws of robotics are: 1.` | diverge @ token 19 | ...The law of the minimum **time**... | ...The law of the minimum **effort**... |
 
-3/6 exact match (with fused ops off). Divergences are due to bf16 numerical precision differences between attention backends — the outputs are semantically equivalent. This is expected and consistent with SGLang's own behavior across different backends (e.g. FlashInfer vs Triton).
+3/6 exact match. Divergences are due to bf16 numerical precision differences between attention backends — top-2 logits are very close at the divergence point, and small floating-point rounding differences flip the argmax. All outputs are semantically coherent. This is expected and consistent with SGLang's own behavior across different backends (e.g. FlashInfer vs Triton).
 
 ## Features
 
